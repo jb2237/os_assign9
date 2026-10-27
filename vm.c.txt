@@ -1,0 +1,108 @@
+#include "param.h"
+#include "types.h"
+#include "defs.h"
+#include "x86.h"
+#include "memlayout.h"
+#include "mmu.h"
+#include "proc.h"
+#include "elf.h"
+
+// Question 1: Print page table structure for current process
+int
+vmprint(void)
+{
+  struct proc *curproc = myproc();
+  pde_t *pgdir = curproc->pgdir;
+  int valid_pages = 0;
+  int pt_pages = 0;
+
+  cprintf("Page table for process %d (%s):\n", curproc->pid, curproc->name);
+
+  // Walk through PDE (Page Directory Entries)
+  for(int i = 0; i < NPDENTRIES; i++){
+    if(pgdir[i] & PTE_P){
+      pt_pages++;
+      pte_t *pgtab = (pte_t*)P2V(PTE_ADDR(pgdir[i]));
+
+      for(int j = 0; j < NPTENTRIES; j++){
+        if(pgtab[j] & PTE_P){
+          uint va = (i << PDXSHIFT) | (j << PTXSHIFT);
+          // Ignore kernel space (addresses at or above KERNBASE)
+          if(va < KERNBASE){
+            uint pa = PTE_ADDR(pgtab[j]);
+            int p = (pgtab[j] & PTE_P) ? 1 : 0;
+            int w = (pgtab[j] & PTE_W) ? 1 : 0;
+            int u = (pgtab[j] & PTE_U) ? 1 : 0;
+
+            cprintf("VA: 0x%x -> PA: 0x%x [P:%d W:%d U:%d]\n", va, pa, p, w, u);
+            valid_pages++;
+          }
+        }
+      }
+    }
+  }
+
+  cprintf("Total valid user pages: %d\n", valid_pages);
+  cprintf("Total page-table pages used: %d\n", pt_pages);
+  return 0;
+}
+
+// Question 2: Modified deallocuvm to skip unmapped lazy pages
+int
+deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
+{
+  pte_t *pte;
+  uint a, pa;
+
+  if(newsz >= oldsz)
+    return oldsz;
+
+  a = PGROUNDUP(newsz);
+  for(; a < oldsz; a += PGSIZE){
+    pte = walkpgdir(pgdir, (char*)a, 0);
+    if(!pte)
+      continue;
+    if(*pte & PTE_P){
+      pa = PTE_ADDR(*pte);
+      if(pa == 0)
+        panic("kfree");
+      char *v = P2V(pa);
+      kfree(v);
+      *pte = 0;
+    }
+  }
+  return newsz;
+}
+
+// Question 2: Modified copyuvm to ignore unmapped lazy pages instead of panicking
+int
+copyuvm(pde_t *pgdir, uint sz)
+{
+  pde_t *d;
+  pte_t *pte;
+  uint pa, i, flags;
+  char *mem;
+
+  if((d = setupkvm()) == 0)
+    return 0;
+  for(i = 0; i < sz; i += PGSIZE){
+    if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
+      continue;
+    if(!(*pte & PTE_P))
+      continue; // Skip pages that haven't been allocated yet (lazy allocation)
+    pa = PTE_ADDR(*pte);
+    flags = PTE_FLAGS(*pte);
+    if((mem = kalloc()) == 0)
+      goto bad;
+    memmove(mem, (char*)P2V(pa), PGSIZE);
+    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {
+      kfree(mem);
+      goto bad;
+    }
+  }
+  return d;
+
+bad:
+  freevm(d);
+  return 0;
+}
